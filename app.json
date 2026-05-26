@@ -1,0 +1,9 @@
+{
+  "name": "CAdmin",
+  "displayName": "CAdmin",
+  "newArchEnabled": false,
+  "android": {
+    "package": "com.sourav_roy.cadmin",
+    "usesCleartextTraffic": true
+  }
+}
