@@ -10,7 +10,10 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  View
+  View,
+  StatusBar, // Chronological Fix: Control immersive display settings from React Native
+  Linking,   // Chronological Fix: Intercept and push users to App Settings intent channel
+  Platform
 } from 'react-native';
 import {CAdminApi} from '../api/cadminApi';
 import {CAdminNative} from '../native/CAdminNative';
@@ -27,8 +30,47 @@ export function LoginScreen() {
   const [loading, setLoading] = useState(false);
   const [loginError, setLoginError] = useState('');
 
+  // Exact parity implementation of checkPermissions() / onRequestPermissionsResult() logic
+  const verifyAndEnforcePermissions = async () => {
+    try {
+      const isGranted = await CAdminNative.requestRequiredPermissions();
+      if (!isGranted) {
+        triggerPermissionAlert();
+      }
+    } catch (err) {
+      triggerPermissionAlert();
+    }
+  };
+
+  const triggerPermissionAlert = () => {
+    // Replicates dynamic feature-label generation depending on target Android SDK versions
+    const targetFeatures = Platform.Version >= 33 ? "Storage/Media" : "Storage and Location";
+    const displayMessage = strings.permissionNotice.replace("%s", targetFeatures);
+
+    Alert.alert(
+      "Permissions Required",
+      displayMessage,
+      [
+        {
+          text: strings.cancel,
+          style: "cancel",
+          // Native parity: Selecting cancel reruns the verification function recursively
+          onPress: () => verifyAndEnforcePermissions() 
+        },
+        {
+          text: strings.openNow,
+          onPress: () => {
+            // Replicates goToAppSetting() function by launching the app's OS configuration menu
+            Linking.openSettings().catch(() => verifyAndEnforcePermissions());
+          }
+        }
+      ],
+      { cancelable: false } // Replicates native modal locking behavior to block random dismiss taps
+    );
+  };
+
   useEffect(() => {
-    CAdminNative.requestRequiredPermissions().catch(() => undefined);
+    verifyAndEnforcePermissions();
   }, []);
 
   async function signIn() {
@@ -70,6 +112,9 @@ export function LoginScreen() {
 
   return (
     <ScrollView style={styles.page} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+      {/* Replicates native immersive visibility window flags entirely inside React Native */}
+      <StatusBar hidden={true} translucent={true} backgroundColor="transparent" barStyle="light-content" />
+
       <ImageBackground source={require('../assets/bglogin.png')} style={styles.hero} resizeMode="cover">
         <Text style={styles.welcome}>{strings.hello}</Text>
         <Text style={styles.signInTitle}>Sign In</Text>

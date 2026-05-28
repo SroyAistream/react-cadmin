@@ -1,5 +1,6 @@
-﻿import {clearSession, getString} from '../state/storage';
+﻿import {clearSession, getString, setValues} from '../state/storage';
 import {CAdminNative} from '../native/CAdminNative';
+import {CAdminApi} from './cadminApi';
 import {getHttpFag, HTTPS_URL} from './config';
 import type {ResponseWrapper, Status} from './types';
 
@@ -42,6 +43,31 @@ export async function apiRequest<T>(path: string, options: ApiOptions = {}): Pro
   const headers: Record<string, string> = {
     'User-Agent': 'OGLE-APP/Android'
   };
+  
+  const url = buildUrl(options.baseUrl ?? getHttpFag(), path, options.query);
+  
+  const getRouterHeader = async () => {
+    let fmaUuid = await getString('fmaUuid');
+    if (!fmaUuid) {
+      try {
+        const details = await CAdminApi.getRouterDetails(0);
+        fmaUuid = details.routerInfo?.uuid ?? details.data?.uuid;
+        if (fmaUuid) await setValues({ fmaUuid });
+      } catch (e) {
+        console.warn(LOG_PREFIX, 'Failed to fetch UUID for header');
+      }
+    }
+    return fmaUuid;
+  };
+
+  // Attach Router header (Capital R) for head-end server requests
+  if (url.includes('demo.aistream.tv') || url.includes('/fag/')) {
+    const uuid = await getRouterHeader();
+    if (uuid) {
+      headers['RouterUUID'] = uuid; 
+    }
+  }
+
   if (options.auth) {
     const token = await getString('token');
     headers.Authentication = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
@@ -53,24 +79,32 @@ export async function apiRequest<T>(path: string, options: ApiOptions = {}): Pro
     headers['Content-Type'] = options.contentType ?? 'application/json';
   }
 
-  const url = buildUrl(options.baseUrl ?? getHttpFag(), path, options.query);
   const requestBody =
     options.body === undefined
       ? undefined
       : options.bodyEncoding === 'raw'
         ? String(options.body)
         : JSON.stringify(options.body);
-  console.log(LOG_PREFIX, 'request:start', {
-    method: options.method ?? 'GET',
-    url,
-    auth: Boolean(options.auth),
-    gzip: Boolean(options.gzip),
-    contentType: headers['Content-Type'],
-    bodyPreview: requestBody ? requestBody.slice(0, 300) : undefined
-  });
+
+  // ENHANCED READABLE LOGGING: REQUEST
+  console.log(
+    LOG_PREFIX, 
+    'request:start\n', 
+    JSON.stringify({
+      method: options.method ?? 'GET',
+      url,
+      headers: headers, // Explicitly log the headers being sent
+      auth: Boolean(options.auth),
+      gzip: Boolean(options.gzip),
+      bodyPreview: requestBody ? requestBody.slice(0, 500) : undefined
+    }, null, 2) // The '2' adds beautiful indentation
+  );
+
   let response: Response;
   try {
-    if (url.startsWith(HTTPS_URL)) {
+    const isMediaHubRequest = url.startsWith(HTTPS_URL) || url.includes('192.168.39.20');
+
+    if (isMediaHubRequest) {
       console.log(LOG_PREFIX, 'request:media-hub-native', {url});
       const nativeResponse = await CAdminNative.mediaHubRequest(
         options.method ?? 'GET',
@@ -99,13 +133,19 @@ export async function apiRequest<T>(path: string, options: ApiOptions = {}): Pro
 
   let parsed: ResponseWrapper<T> | T | undefined;
   const text = await response.text();
-  console.log(LOG_PREFIX, 'response:raw', {
-    url,
-    status: response.status,
-    ok: response.ok,
-    contentType: response.headers.get('content-type'),
-    textPreview: text.slice(0, 500)
-  });
+  
+  // ENHANCED READABLE LOGGING: RESPONSE
+  console.log(
+    LOG_PREFIX, 
+    'response:raw\n', 
+    JSON.stringify({
+      url,
+      status: response.status,
+      ok: response.ok,
+      fullBody: text // Log the entire response body cleanly
+    }, null, 2)
+  );
+
   if (text) {
     try {
       parsed = JSON.parse(text);
@@ -126,7 +166,7 @@ export async function apiRequest<T>(path: string, options: ApiOptions = {}): Pro
 
   const body = (parsed as ResponseWrapper<T>)?.body ?? (parsed as T);
   const status = readStatus(body);
-  console.log(LOG_PREFIX, 'response:parsed', {url, status, hasBody: body != null});
+  
   if (status?.code === 401) {
     await clearSession();
     throw new TokenExpiredError('Token expired');
@@ -136,5 +176,3 @@ export async function apiRequest<T>(path: string, options: ApiOptions = {}): Pro
   }
   return body as T;
 }
-
-

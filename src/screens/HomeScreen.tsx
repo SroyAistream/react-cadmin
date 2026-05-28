@@ -73,6 +73,9 @@ export function HomeScreen() {
   const [working, setWorking] = useState(false);
   const [error1, setError1] = useState('');
   const [error2, setError2] = useState('');
+  
+  // STATE MACHINE LOCK
+  const [syncStep, setSyncStep] = useState<'IDLE' | 'FETCHED' | 'HUB_SYNCED'>('IDLE');
 
   const hasFreshFagData = useMemo(() => Boolean(expiry && expiry > Date.now()), [expiry]);
   const dataExpired = useMemo(() => Boolean(expiry && expiry <= Date.now()), [expiry]);
@@ -88,43 +91,39 @@ export function HomeScreen() {
     setExpiry(exp);
   }, []);
 
-  const loadFmaDetails = useCallback(async () => {
+  const loadFmaDetails = useCallback(async (isBackgroundPoll = false) => {
     console.log(LOG_PREFIX, 'loadFmaDetails:start', {mediaHubBaseUrl: HTTPS_URL});
     try {
-      console.log(LOG_PREFIX, 'loadFmaDetails:checkStatus:start');
       await CAdminApi.checkStatus();
-      console.log(LOG_PREFIX, 'loadFmaDetails:checkStatus:success');
-      console.log(LOG_PREFIX, 'loadFmaDetails:getRouterDetails:start');
       const details = await CAdminApi.getRouterDetails(0);
-      console.log(LOG_PREFIX, 'loadFmaDetails:getRouterDetails:success', details);
       const router = details.routerInfo ?? details.data;
+      const uuid = router?.uuid ?? '';
       setFmaName(router?.name ?? '');
-      setFmaId(router?.uuid ?? '');
+      setFmaId(uuid);
       setFmaLastUpdate((router?.fmaSyncTime ?? router?.fma_sync_time ?? 0) * 1000);
       setFmaState('CONNECTED');
-      setError2('');
+
+      if (uuid) {
+        await setValues({ fmaUuid: uuid });
+      }
+      if (!isBackgroundPoll) setError2(''); 
 
       const currentSsid = await CAdminNative.getCurrentSsid();
-      console.log(LOG_PREFIX, 'loadFmaDetails:currentSsid', {currentSsid});
       if (currentSsid) {
         const updates = await getFmaWifiLastUpdates();
         const syncTime = (router?.fmaSyncTime ?? router?.fma_sync_time ?? 0) * 1000;
         if (!updates[currentSsid] || updates[currentSsid] < syncTime) {
-          console.log(LOG_PREFIX, 'loadFmaDetails:updateLastSyncForSsid', {currentSsid, syncTime});
           await setValues({fmaWifiLastUpdates: JSON.stringify({...updates, [currentSsid]: syncTime || Date.now()})});
         }
       }
     } catch (error) {
-      console.log(LOG_PREFIX, 'loadFmaDetails:error', {
-        name: error instanceof Error ? error.name : typeof error,
-        message: errorMessage(error),
-        raw: error
-      });
       setFmaName('');
       setFmaId('');
       setFmaLastUpdate(0);
       setFmaState('DISCONNECTED');
-      setError2(`Please Connect to SoNET Wi-Fi to Sync Data with SMA. Media hub: ${HTTPS_URL} ${errorMessage(error)}`);
+      if (!isBackgroundPoll) {
+        setError2(`Media hub unreachable: ${errorMessage(error)}`);
+      }
     }
   }, []);
 
@@ -146,20 +145,25 @@ export function HomeScreen() {
     useCallback(() => {
       refreshLocal();
       checkInternetConnection();
-      loadFmaDetails();
-      const timer = setInterval(() => {
-        checkInternetConnection();
-        loadFmaDetails();
-      }, 5000);
-      return () => clearInterval(timer);
-    }, [refreshLocal, checkInternetConnection, loadFmaDetails])
+      
+      if (hasFreshFagData && syncStep !== 'HUB_SYNCED') {
+         loadFmaDetails(true); 
+      } else if (syncStep === 'HUB_SYNCED') {
+         // UI Cleanup: Force UI to update when returning from Wi-Fi settings
+         setFmaState('DISCONNECTED'); 
+      }
+    }, [refreshLocal, checkInternetConnection, loadFmaDetails, hasFreshFagData, syncStep])
   );
 
+  // INTELLIGENT UI PROMPTS
   useEffect(() => {
     if (dataExpired) {
       setError2('FAG data has expired, Please Synchronize Data with SoNET Head-End System.');
+    } else if (hasFreshFagData && fagState === 'CONNECTED' && fmaState === 'DISCONNECTED' && syncStep !== 'HUB_SYNCED') {
+      // Automatically prompt the user to switch to the Hub if they are on the internet with fresh data
+      setError2('Data is ready. Please connect to the Media Hub Wi-Fi to sync the data.');
     }
-  }, [dataExpired]);
+  }, [dataExpired, hasFreshFagData, fagState, fmaState, syncStep]);
 
   async function fetchDataFromFag() {
     console.log(LOG_PREFIX, 'fetchDataFromFag:start');
@@ -172,6 +176,7 @@ export function HomeScreen() {
       const drmKeys = await runFetchStep('DRM keys', CAdminApi.getDrmKeys);
       const playerInfo = await runFetchStep('Player info', CAdminApi.getAppPlayerInfos);
       const firmware = await CAdminApi.getFmaVersionInfo().catch(() => undefined);
+
       const fagData: FagSyncData = {
         user_permissions: asArray(readDataField(rechargePins)),
         movies: asArray(readDataField(movies)),
@@ -180,14 +185,7 @@ export function HomeScreen() {
         players: asArray(readDataField(playerInfo)),
         firmware
       };
-      console.log(LOG_PREFIX, 'fetchDataFromFag:fagDataSummary', {
-        userPermissions: fagData.user_permissions?.length ?? 0,
-        movies: fagData.movies?.length ?? 0,
-        fmaList: fagData.fma_list?.length ?? 0,
-        drmKeys: fagData.drm_keys?.length ?? 0,
-        players: fagData.players?.length ?? 0,
-        hasFirmware: Boolean(fagData.firmware)
-      });
+
       const now = Date.now();
       await setValues({
         fagIp: getHttpFag(),
@@ -195,13 +193,16 @@ export function HomeScreen() {
         dataExpiryTime: now + 24 * 60 * 60 * 1000,
         fagData: JSON.stringify(fagData)
       });
+      
+      setSyncStep('FETCHED');
+      Alert.alert('Success', 'Data fetched from server. Now searching for Media Hub...');
+
       await refreshLocal();
       const connected = await promptAndConnectFmaWifi();
       if (connected) {
         await loadFmaDetails();
       }
     } catch (error) {
-      console.log(LOG_PREFIX, 'fetchDataFromFag:error', {message: errorMessage(error), raw: error});
       setError1(errorMessage(error));
     } finally {
       setWorking(false);
@@ -210,12 +211,8 @@ export function HomeScreen() {
 
   async function runFetchStep(label: string, action: () => Promise<unknown>) {
     try {
-      console.log(LOG_PREFIX, 'runFetchStep:start', {label});
-      const result = await action();
-      console.log(LOG_PREFIX, 'runFetchStep:success', {label});
-      return result;
+      return await action();
     } catch (error) {
-      console.log(LOG_PREFIX, 'runFetchStep:error', {label, message: errorMessage(error), raw: error});
       throw new Error(`${label}: ${errorMessage(error)}`);
     }
   }
@@ -223,10 +220,8 @@ export function HomeScreen() {
   async function promptAndConnectFmaWifi() {
     console.log(LOG_PREFIX, 'promptAndConnectFmaWifi:start');
     const selected = await findFmaWifi();
-    console.log(LOG_PREFIX, 'promptAndConnectFmaWifi:selected', selected);
 
     if (!selected) {
-      Alert.alert('', 'Fetch Data Success. No SoNET media hub Wi-Fi was found nearby.');
       setError2('No SoNET media hub Wi-Fi was found nearby. Please move closer to the media hub and try again.');
       return false;
     }
@@ -235,7 +230,7 @@ export function HomeScreen() {
       'Fetch Data Success',
       `Connect to media hub Wi-Fi "${selected}" now to sync data with SMA?`
     );
-    console.log(LOG_PREFIX, 'promptAndConnectFmaWifi:userChoice', {selected, shouldConnect});
+    
     if (!shouldConnect) {
       setError2(`Please connect to ${selected} Wi-Fi to sync data with SMA.`);
       return false;
@@ -245,55 +240,30 @@ export function HomeScreen() {
   }
 
   async function findFmaWifi() {
-    console.log(LOG_PREFIX, 'switchFmaWifi:start');
     const scannedWifi = await CAdminNative.scanWifi();
-    console.log(LOG_PREFIX, 'switchFmaWifi:scanResults', {
-      count: scannedWifi.length,
-      items: scannedWifi.map(item => ({ssid: item.ssid, bssid: item.bssid, level: item.level}))
-    });
     const scannedByBssid = new Map<string, string>();
     const scannedSsids = new Set<string>();
+    
     scannedWifi.forEach(item => {
-      if (item.ssid) {
-        scannedSsids.add(item.ssid);
-      }
+      if (item.ssid) scannedSsids.add(item.ssid);
       const bssid = normalizeBssid(item.bssid);
-      if (bssid && item.ssid) {
-        scannedByBssid.set(bssid, item.ssid);
-      }
+      if (bssid && item.ssid) scannedByBssid.set(bssid, item.ssid);
     });
 
     const fagData = await getStoredFagData();
     const knownFmas = asArray(fagData.fma_list) as FmaWifiInfo[];
-    console.log(LOG_PREFIX, 'switchFmaWifi:knownFmas', {
-      count: knownFmas.length,
-      items: knownFmas.map(fma => ({
-        routerid: fma.routerid,
-        ssid: fma.ssid,
-        ssid5g: fma.ssid5g,
-        mac: fma.mac,
-        mac_5g: fma.mac_5g
-      }))
-    });
     const candidates = new Set<string>();
+    
     knownFmas.forEach(fma => {
       const mac = normalizeBssid(fma.mac);
       const mac5g = normalizeBssid(fma.mac_5g);
       const ssid = mac ? scannedByBssid.get(mac) : undefined;
       const ssid5g = mac5g ? scannedByBssid.get(mac5g) : undefined;
-      console.log(LOG_PREFIX, 'switchFmaWifi:matchAttempt', {
-        routerid: fma.routerid,
-        mac,
-        mac5g,
-        matchedSsid: ssid,
-        matchedSsid5g: ssid5g
-      });
       if (ssid) candidates.add(ssid);
       if (ssid5g) candidates.add(ssid5g);
     });
 
     if (!candidates.size) {
-      console.log(LOG_PREFIX, 'switchFmaWifi:noBssidMatches:fallbackToAllScannedSsids');
       scannedSsids.forEach(ssid => candidates.add(ssid));
     }
 
@@ -308,24 +278,13 @@ export function HomeScreen() {
         selected = ssid;
       }
     }
-
-    console.log(LOG_PREFIX, 'switchFmaWifi:selected', {
-      selected,
-      candidates: Array.from(candidates),
-      updates
-    });
     return selected;
   }
 
   async function switchFmaWifi(selected: string) {
-    console.log(LOG_PREFIX, 'switchFmaWifi:connect:start', {selected});
     const switched = await CAdminNative.switchWifi(selected, '');
-    console.log(LOG_PREFIX, 'switchFmaWifi:switchResult', {selected, switched});
     if (!switched) {
-      Alert.alert(
-        '',
-        `Could not connect automatically to ${selected}. Please connect to this Wi-Fi from the Android prompt or Wi-Fi settings, then press Sync Data.`
-      );
+      Alert.alert('', `Could not connect automatically to ${selected}. Please connect to this Wi-Fi from the Android settings, then press Sync Data.`);
       setError2(`Please connect to ${selected} Wi-Fi to sync data with SMA.`);
       return false;
     }
@@ -333,54 +292,54 @@ export function HomeScreen() {
   }
 
   async function syncFmaData() {
-    console.log(LOG_PREFIX, 'syncFmaData:start');
     if (dataExpired) {
-      console.log(LOG_PREFIX, 'syncFmaData:blocked:dataExpired');
       setError2('FAG data has expired, Please Synchronize Data with SoNET Head-End System.');
       return;
     }
     setWorking(true);
     setError2('');
+    
     try {
+      await loadFmaDetails(false);
       await CAdminApi.checkStatus();
+      
       const saved = await getString('fagData');
       const fagData = saved ? (JSON.parse(saved) as FagSyncData) : {};
-      console.log(LOG_PREFIX, 'syncFmaData:fagDataSummary', {
-        userPermissions: fagData.user_permissions?.length ?? 0,
-        movies: fagData.movies?.length ?? 0,
-        fmaList: fagData.fma_list?.length ?? 0,
-        drmKeys: fagData.drm_keys?.length ?? 0,
-        players: fagData.players?.length ?? 0,
-        hasFirmware: Boolean(fagData.firmware)
-      });
+      
       const fmaOffline = await CAdminApi.getFmaData(Date.now());
-      console.log(LOG_PREFIX, 'syncFmaData:getFmaData:success', fmaOffline);
       await CAdminApi.updateFmaData(fagData);
-      console.log(LOG_PREFIX, 'syncFmaData:updateFmaData:success');
-      await loadFmaDetails();
-      Alert.alert('', 'Sync Data Success');
-      const internetSSID = await getString('internetSSID');
-      const currentSSID = await CAdminNative.getCurrentSsid();
-      console.log(LOG_PREFIX, 'syncFmaData:restoreInternet', {internetSSID, currentSSID});
-      if (internetSSID && internetSSID !== currentSSID) {
-        const switched = await CAdminNative.switchWifi(internetSSID, '');
-        console.log(LOG_PREFIX, 'syncFmaData:restoreWifiResult', {internetSSID, switched});
-      } else if (!internetSSID) {
-        const opened = await CAdminNative.openMobileData();
-        console.log(LOG_PREFIX, 'syncFmaData:openMobileDataResult', {opened});
-      }
+      
+      setSyncStep('HUB_SYNCED');
       const fmaData = readDataField(fmaOffline) as Record<string, unknown> | undefined;
-      console.log(LOG_PREFIX, 'syncFmaData:uploadFmaHistorySummary', {
-        routerState: asArray(fmaData?.router_state).length,
-        userPermissions: asArray(fmaData?.user_permissions).length,
-        userDatas: asArray(fmaData?.user_datas).length
-      });
-      await CAdminApi.reportWifiStates(asArray(fmaData?.router_state));
-      await CAdminApi.syncFmaData(asArray(fmaData?.user_permissions));
-      await CAdminApi.reportUserData({report_data: asArray(fmaData?.user_datas)});
-      Alert.alert('', 'Upload Data Success');
+
+      Alert.alert(
+        'Hub Sync Complete',
+        'Data successfully synced to Media Hub.\n\nTo complete the final server upload, please switch to Internet (Wi-Fi or Mobile Data) and then press Continue Upload.',
+        [
+          {
+            text: 'Continue Upload',
+            onPress: async () => {
+              setFmaState('DISCONNECTED'); // Clean up UI state immediately
+              setWorking(true);
+              try {
+                await CAdminApi.reportWifiStates(asArray(fmaData?.router_state));
+                await CAdminApi.syncFmaData(asArray(fmaData?.user_permissions));
+                await CAdminApi.reportUserData({report_data: asArray(fmaData?.user_datas)});
+                
+                setSyncStep('IDLE');
+                setError2(''); 
+                Alert.alert('Success', 'All Data Uploaded to Head-End Successfully.');
+              } catch (uploadError) {
+                setError2('Final upload failed. Are you sure you are connected to the internet?');
+              } finally {
+                setWorking(false);
+              }
+            }
+          }
+        ],
+        { cancelable: false }
+      );
     } catch (error) {
-      console.log(LOG_PREFIX, 'syncFmaData:error', {message: errorMessage(error), raw: error});
       setError2(errorMessage(error));
     } finally {
       setWorking(false);
@@ -397,7 +356,10 @@ export function HomeScreen() {
         <Pair label="Data Server(FAG) IP:" value={fagIp} />
         <Pair label="Last Update Time:" value={formatTime(lastUpdate)} />
         <Pair label="Data Expiry Date:" value={formatTime(expiry)} danger={dataExpired} />
-        <View style={styles.action}><PrimaryButton title="FETCH DATA" onPress={fetchDataFromFag} disabled={working || fagState !== 'CONNECTED' || hasFreshFagData} /></View>
+        <View style={styles.action}>
+           {/* FIX: Removed hasFreshFagData, added fmaState lock so it enables strictly when on Internet */}
+           <PrimaryButton title="FETCH DATA" onPress={fetchDataFromFag} disabled={working || fagState !== 'CONNECTED' || fmaState === 'CONNECTED'} />
+        </View>
         {!!error1 && <Text style={styles.error}>{error1}</Text>}
       </Section>
 
@@ -406,7 +368,10 @@ export function HomeScreen() {
         <Pair label="SMA Name:" value={fmaName} />
         <Pair label="SMA ID:" value={fmaId} />
         <Pair label="Last Update Time:" value={formatTime(fmaLastUpdate)} />
-        <View style={styles.action}><PrimaryButton title="Sync DATA" onPress={syncFmaData} disabled={working || fmaState !== 'CONNECTED' || dataExpired} /></View>
+        <View style={styles.action}>
+           {/* FIX: Added syncStep lock to explicitly disable button when waiting to upload */}
+           <PrimaryButton title="Sync DATA" onPress={syncFmaData} disabled={working || fmaState !== 'CONNECTED' || dataExpired || syncStep === 'HUB_SYNCED'} />
+        </View>
         {!!error2 && <Text style={styles.error}>{error2}</Text>}
       </Section>
     </ScrollView>
